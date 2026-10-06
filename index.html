@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FEA Lab</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>FEA Lab <span>specimen vs. simulation</span></h1>
+    <div id="status" class="status">Ready</div>
+  </header>
+
+  <main class="layout">
+    <aside class="panel inputs">
+      <section>
+        <h2>Experiment</h2>
+        <label class="row">Test
+          <select id="test">
+            <option value="tension">Tensile test</option>
+            <option value="compression">Compression test</option>
+            <option value="cantilever">Cantilever bending</option>
+            <option value="threePoint">3-point bending</option>
+            <option value="buckling">Buckling (column)</option>
+          </select>
+        </label>
+        <label class="row" data-for="buckling">End conditions
+          <select id="ends">
+            <option value="pinned-pinned">Pinned – pinned (K = 1)</option>
+            <option value="fixed-free">Fixed – free (K = 2)</option>
+            <option value="fixed-pinned">Fixed – pinned (K = 0.7)</option>
+            <option value="fixed-fixed">Fixed – fixed (K = 0.5)</option>
+          </select>
+        </label>
+      </section>
+
+      <section>
+        <h2>Specimen</h2>
+        <label class="row">Length L <span class="field"><input id="L" type="number" value="140" step="any"><span class="unit">mm</span></span></label>
+        <label class="row">Width b <span class="field"><input id="b" type="number" value="10" step="any"><span class="unit">mm</span></span></label>
+        <label class="row">Thickness h <span class="field"><input id="h" type="number" value="4" step="any"><span class="unit">mm</span></span></label>
+      </section>
+
+      <section>
+        <h2>Material</h2>
+        <label class="row">Preset <select id="material"></select></label>
+        <label class="row">Young's modulus E <span class="field"><input id="E" type="number" step="any"><span class="unit">GPa</span></span></label>
+        <label class="row">Poisson's ratio ν <span class="field"><input id="nu" type="number" step="any"><span class="unit"></span></span></label>
+        <label class="row"><span>Yield strength σ<sub>y</sub></span> <span class="field"><input id="sy" type="number" step="any"><span class="unit">MPa</span></span></label>
+      </section>
+
+      <section>
+        <h2>Load</h2>
+        <label class="row"><span id="forceLabel">Force F</span> <span class="field"><input id="F" type="number" step="any"><span class="unit">N</span></span></label>
+        <label class="row" data-for="cantilever">Angle from beam axis α <span class="field"><input id="alpha" type="number" value="90" step="any"><span class="unit">°</span></span></label>
+        <label class="row" data-for="cantilever">Angle around axis β <span class="field"><input id="beta" type="number" value="0" step="any"><span class="unit">°</span></span></label>
+        <p class="hint" data-for="cantilever">α = 90°, β = 0° pushes the tip straight down. α = 0° pulls along the beam. β = 90° pushes sideways.</p>
+        <p class="hint" id="forceComponents" data-for="cantilever"></p>
+        <label class="row">Strain gauge at x <span class="field"><input id="xp" type="number" step="any"><span class="unit">mm</span></span></label>
+      </section>
+
+      <section>
+        <h2>Lab measurement <small>(optional)</small></h2>
+        <label class="row" data-for="tension compression cantilever threePoint"><span id="measDeltaLabel">Measured deflection</span> <span class="field"><input id="measDelta" type="number" step="any" placeholder="—"><span class="unit">mm</span></span></label>
+        <label class="row" data-for="tension compression cantilever threePoint">Measured strain <span class="field"><input id="measStrain" type="number" step="any" placeholder="—"><span class="unit">µε</span></span></label>
+        <label class="row" data-for="buckling">Measured buckling load <span class="field"><input id="measPcr" type="number" step="any" placeholder="—"><span class="unit">N</span></span></label>
+      </section>
+
+      <section>
+        <h2>Mesh</h2>
+        <label class="row">Elements along length <span class="field"><input id="nx" type="number" value="40" step="4"><span class="unit"></span></span></label>
+        <label class="row">Elements across width <span class="field"><input id="ny" type="number" value="4" step="2"><span class="unit"></span></span></label>
+        <label class="row">Elements through thickness <span class="field"><input id="nz" type="number" value="4" step="2"><span class="unit"></span></span></label>
+        <p class="hint" id="meshInfo"></p>
+      </section>
+    </aside>
+
+    <section class="viewport">
+      <div id="view" class="view"></div>
+      <div class="view-tools">
+        <label>Show
+          <select id="field">
+            <option value="vm">von Mises stress</option>
+            <option value="sx">Normal stress σx</option>
+            <option value="umag">Displacement</option>
+            <option value="mode">Buckling mode shape</option>
+          </select>
+        </label>
+        <label>Colour range
+          <select id="range">
+            <option value="yield">0 – σy (yield)</option>
+            <option value="auto">Auto (min – max)</option>
+            <option value="fixed">Fixed max</option>
+          </select>
+        </label>
+        <label id="rangeMaxWrap" hidden>Max <input id="rangeMax" type="number" step="any" value="100"></label>
+        <label>Deformation scale × <input id="scale" type="number" step="any" min="0"></label>
+        <button id="autoScale" type="button" title="Pick a new deformation scale for the current result">Auto</button>
+        <span id="scaleUsed" class="muted"></span>
+        <label class="check"><input id="showMesh" type="checkbox" checked> Mesh</label>
+        <label class="check"><input id="showUndeformed" type="checkbox" checked> Undeformed</label>
+        <button id="resetView" type="button">Reset view</button>
+      </div>
+      <div id="legend" class="legend"></div>
+      <div id="error" class="error" hidden></div>
+    </section>
+
+    <aside class="panel results">
+      <h2>Results</h2>
+      <div id="warnings"></div>
+      <table class="cmp" id="results"></table>
+      <div class="explain" id="explain"></div>
+      <div class="buttons">
+        <button id="saveRun" type="button" class="primary">Save this run</button>
+      </div>
+    </aside>
+  </main>
+
+  <section class="runs panel">
+    <div class="runs-head">
+      <h2>Saved runs</h2>
+      <div class="buttons">
+        <button id="exportCsv" type="button">Export CSV</button>
+        <button id="clearRuns" type="button">Clear</button>
+      </div>
+    </div>
+    <div class="table-wrap"><table id="runs"></table></div>
+  </section>
+
+  <script src="vendor/three.min.js"></script>
+  <script src="vendor/OrbitControls.js"></script>
+  <script src="js/fe.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
