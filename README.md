@@ -31,7 +31,10 @@ The app walks through three steps (you can jump back to any step later):
 Results: von Mises stress, normal stress σx, displacement and the buckling mode
 as banded contours. The colour range runs from 0 to the yield strength by
 default, and anything above yield is shown in magenta. The deformation scale is
-a fixed number, so a bigger force really does look bigger. The results table
+a fixed number, so a bigger force really does look bigger. "Animate" plays the
+result as the load rises from 0 to F and back, with shape and colours growing
+together, so you can watch where yielding (magenta) starts. For buckling it
+swings the mode shape. The results table
 compares FE, hand calc and your lab measurement (strain gauge, deflection or
 buckling load), and "Save this run" builds a comparison table you can export to
 CSV.

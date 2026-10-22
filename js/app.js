@@ -79,6 +79,7 @@
     // Pick a new deformation scale on the next draw, then keep it fixed so that
     // changing the force, material or size visibly changes the deformed shape.
     scaleAuto: true,
+    animate: false,
   };
 
   const key = () => `${state.geometry}:${state.scenario}`;
@@ -345,6 +346,7 @@
         $('resultsEmpty').hidden = false;
         $('resultsBody').hidden = true;
         View.preview(mesh);
+        syncAnimation();
         setStatus('Choose a test in step 3 to run the simulation');
         return;
       }
@@ -382,6 +384,7 @@
         $('resultsEmpty').hidden = false;
         $('resultsBody').hidden = true;
         try { View.preview(FE.buildMesh(p.geometry, p.dims, p.density)); } catch (err) { /* message already shown */ }
+        syncAnimation();
       }
     }, 0));
   }
@@ -419,6 +422,21 @@
     }
     $('scale').disabled = used.isMode;
     $('scaleUsed').textContent = used.label;
+    syncAnimation();
+  }
+
+  // Play the result as the load goes from 0 to F (or the buckling mode swinging).
+  function syncAnimation() {
+    const r = state.result, btn = $('animate'), info = $('animInfo');
+    btn.disabled = !r;
+    const on = View.setPlaying(state.animate && !!r, f => {
+      info.textContent = $('field').value === 'mode' && r.buckling
+        ? 'buckling mode, swinging'
+        : `load ${Math.round(100 * f)}% · ${fmt(f * r.params.F, 3)} N`;
+    });
+    btn.textContent = on ? '❚❚ Pause' : '▶ Animate';
+    btn.classList.toggle('on', on);
+    if (!on) info.textContent = '';
   }
 
   // ---------- results ----------
@@ -626,6 +644,9 @@
     const BEYOND = [0.85, 0.2, 0.85]; // magenta: outside the colour range (e.g. above yield)
     let renderer, scene, camera, controls, container, model, colorTex, fitKey = '';
     let disposables = [];
+    // Animation: the solution is linear, so the result at a fraction f of the load is f × the result.
+    const PERIOD = 3000; // ms per cycle
+    let anim = null, playing = false, t0 = 0;
 
     function bandRGB(i) {
       const c = new THREE.Color().setHSL((1 - i / (BANDS - 1)) * 240 / 360, 0.95, 0.5);
@@ -682,6 +703,11 @@
       (function loop() {
         requestAnimationFrame(loop);
         controls.update();
+        if (playing && anim) {
+          const ph = 2 * Math.PI * ((performance.now() - t0) % PERIOD) / PERIOD;
+          // Static tests: load rises 0 → F and back. Buckling mode: swings to both sides.
+          applyFactor(anim.isMode ? Math.sin(ph) : (1 - Math.cos(ph)) / 2);
+        }
         renderer.render(scene, camera);
       })();
     }
@@ -719,6 +745,40 @@
       const g = track(new THREE.BufferGeometry());
       g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
       model.add(new THREE.LineSegments(g, track(new THREE.LineBasicMaterial({ color, transparent: true, opacity }))));
+      return { geo: g, nodes: pairs };
+    }
+
+    // Moves every animated vertex and glyph to load fraction f and recolours the surface.
+    function applyFactor(f) {
+      const { xyz, disp, scale, texU, targets, glyphs } = anim, s = f * scale;
+      for (const { geo, nodes, uv } of targets) {
+        const P = geo.attributes.position.array, UV = uv && geo.attributes.uv.array;
+        for (let k = 0; k < nodes.length; k++) {
+          const n = nodes[k];
+          P[3 * k] = xyz[3 * n] + s * disp[3 * n];
+          P[3 * k + 1] = xyz[3 * n + 1] + s * disp[3 * n + 1];
+          P[3 * k + 2] = xyz[3 * n + 2] + s * disp[3 * n + 2];
+          if (UV) UV[2 * k] = texU(n, anim.isMode ? 1 : f);
+        }
+        geo.attributes.position.needsUpdate = true;
+        if (UV) { geo.attributes.uv.needsUpdate = true; geo.computeVertexNormals(); }
+      }
+      // Glyphs were placed at full load; shift them with their node.
+      for (const { obj, n, base } of glyphs) {
+        const d = (f - 1) * scale;
+        obj.position.set(base.x + d * disp[3 * n], base.y + d * disp[3 * n + 1], base.z + d * disp[3 * n + 2]);
+      }
+      if (anim.onFrame) anim.onFrame(f);
+    }
+
+    function setPlaying(on, onFrame) {
+      playing = !!on && !!anim;
+      t0 = performance.now();
+      if (anim) {
+        anim.onFrame = playing ? onFrame : null;
+        if (!playing) applyFactor(1);
+      }
+      return playing;
     }
 
     // Boundary quads as separate flat-shaded faces; uv.x carries the colour value.
@@ -738,10 +798,13 @@
       geo.setIndex(IDX);
       geo.computeVertexNormals();
       model.add(new THREE.Mesh(geo, track(material)));
+      return { geo, nodes: b, uv: true };
     }
 
     function preview(mesh) {
       clear();
+      anim = null;
+      playing = false;
       const xyz = mesh.xyz, pos = n => [xyz[3 * n], xyz[3 * n + 1], xyz[3 * n + 2]];
       surface(mesh, pos, null, new THREE.MeshLambertMaterial({
         color: 0xb7bfcc, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
@@ -783,8 +846,8 @@
           vmin = c - d; vmax = c + d;
         }
       }
-      const texU = n => {
-        let t = (values[n] - vmin) / (vmax - vmin);
+      const texU = (n, f = 1) => {
+        let t = (f * values[n] - vmin) / (vmax - vmin);
         if (!fixedTop) t = Math.min(1 - 1e-6, Math.max(0, t));
         return Math.min(0.999, Math.max(0.001, (1 + t * BANDS) / (BANDS + 2)));
       };
@@ -801,13 +864,15 @@
       }
       const pos = n => [xyz[3 * n] + scale * disp[3 * n], xyz[3 * n + 1] + scale * disp[3 * n + 1], xyz[3 * n + 2] + scale * disp[3 * n + 2]];
 
-      surface(mesh, pos, texU, new THREE.MeshLambertMaterial({
+      const targets = [surface(mesh, pos, texU, new THREE.MeshLambertMaterial({
         map: colorTex, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
-      }));
-      if (o.showMesh) lines(mesh.edges, pos, 0x000000, 0.22);
+      }))];
+      if (o.showMesh) targets.push(lines(mesh.edges, pos, 0x000000, 0.22));
       if (o.showUndeformed) lines(mesh.features, n => [xyz[3 * n], xyz[3 * n + 1], xyz[3 * n + 2]], 0x7a8494, 0.7);
 
-      glyphs(r, pos);
+      const onFrame = anim && anim.onFrame;
+      anim = { xyz, disp, scale, texU, targets, glyphs: glyphs(r, pos), isMode: !!isMode, onFrame };
+      if (!playing) applyFactor(1);
       legend(title, unit, vmin, vmax, rangeNote, o.field === 'sx');
       fitOnce(mesh);
       return { scale, label, isMode: !!isMode };
@@ -828,20 +893,25 @@
       const mesh = r.mesh, p = r.params, L = mesh.L, t = mesh.t;
       const wAt = x => mesh.width(x), s = Math.max(wAt(0), t), len = 0.22 * L, gap = 0.015 * L;
       const grey = track(new THREE.MeshLambertMaterial({ color: 0x8a94a6, transparent: true, opacity: 0.85 }));
-      const add = (geom, x, y, z) => {
+      const moving = []; // glyphs that follow a node when the result is animated
+      const follow = (obj, n) => { if (n !== undefined) moving.push({ obj, n, base: obj.position.clone() }); };
+      const add = (geom, x, y, z, n) => {
         const m = new THREE.Mesh(track(geom), grey);
         m.position.set(x, y, z);
         model.add(m);
+        follow(m, n);
       };
-      const node = (x, y, z) => pos(nearest(mesh, x, y, z));
+      const node = (x, y, z) => { const n = nearest(mesh, x, y, z), q = pos(n); q.n = n; return q; };
       const plate = (X, side) => add(new THREE.BoxGeometry(0.06 * s + 1, wAt(X) * 1.8, t * 1.8), X + side * (0.03 * s + 0.5), 0, 0);
-      const ball = X => add(new THREE.SphereGeometry(0.18 * s, 16, 12), ...node(X, 0, 0));
+      const ball = X => { const q = node(X, 0, 0); add(new THREE.SphereGeometry(0.18 * s, 16, 12), ...q, q.n); };
       const rod = (X, z, rr) => add(new THREE.CylinderGeometry(rr, rr, wAt(X) * 1.5, 20), X, 0, z);
       const arrow = (dir, at) => {
         // Pulling forces start at the point; pushing forces end at it.
         const d = new THREE.Vector3(...dir).normalize(), pt = new THREE.Vector3(...at);
         const origin = d.x > 0.3 ? pt : pt.clone().addScaledVector(d, -len);
-        model.add(new THREE.ArrowHelper(d, origin, len, 0xd92d20, len * 0.22, len * 0.11));
+        const a = new THREE.ArrowHelper(d, origin, len, 0xd92d20, len * 0.22, len * 0.11);
+        model.add(a);
+        follow(a, at.n);
       };
       const endPt = (X, dx) => { const q = node(X, 0, 0); q[0] += dx; return q; };
 
@@ -872,7 +942,7 @@
           if (p.ends === 'pinned-pinned') { arrow([1, 0, 0], endPt(0, -gap)); ball(L); }
           if (p.ends === 'fixed-pinned') ball(L);
           arrow([-1, 0, 0], endPt(L, p.ends === 'fixed-fixed' ? gap + 0.06 * s + 1 : gap));
-          if (p.ends === 'fixed-fixed') add(new THREE.BoxGeometry(0.06 * s + 1, wAt(L) * 1.8, t * 1.8), ...endPt(L, 0.03 * s + 0.5));
+          if (p.ends === 'fixed-fixed') { const q = endPt(L, 0.03 * s + 0.5); add(new THREE.BoxGeometry(0.06 * s + 1, wAt(L) * 1.8, t * 1.8), ...q, q.n); }
           break;
         case 'manual': {
           const m = p.manual, rr = 0.12 * s;
@@ -892,6 +962,7 @@
           break;
         }
       }
+      return moving;
     }
 
     function legend(title, unit, vmin, vmax, beyondNote, beyondBelow) {
@@ -912,7 +983,7 @@
       $('legend').hidden = false;
     }
 
-    return { init, update, preview, fit };
+    return { init, update, preview, fit, setPlaying };
   })();
 
   // ---------- start ----------
@@ -937,6 +1008,7 @@
     ['field', 'showMesh', 'showUndeformed'].forEach(id => $(id).addEventListener('change', redraw));
     $('scale').addEventListener('change', () => { state.scaleAuto = !(parseFloat($('scale').value) > 0); redraw(); });
     $('autoScale').addEventListener('click', () => { state.scaleAuto = true; redraw(); });
+    $('animate').addEventListener('click', () => { state.animate = !state.animate; syncAnimation(); });
     $('range').addEventListener('change', () => { $('rangeMaxWrap').hidden = $('range').value !== 'fixed'; redraw(); });
     $('rangeMax').addEventListener('change', redraw);
     $('resetView').addEventListener('click', () => state.result && View.fit(state.result.mesh));

@@ -263,3 +263,6 @@ table.cmp { width: 100%; border-collapse: collapse; font-variant-numeric: tabula
 
 .empty-state { color: var(--muted); }
 .lab { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); }
+
+#animate.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+.anim-info { min-width: 150px; font-variant-numeric: tabular-nums; }
