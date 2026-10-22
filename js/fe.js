@@ -1,23 +1,36 @@
 /*
- * FEA Lab solver: linear 3D elasticity on a structured box mesh of a beam.
+ * FEA Lab solver: linear 3D elasticity on hexahedral specimen meshes.
  * Units: mm, N, MPa (N/mm²).
  *
- * Element: 8-node hexahedron with Wilson-Taylor incompatible modes, so a
- * coarse mesh still bends correctly (no shear locking). All elements are the
- * same box, so the element matrices are built once per analysis.
- * Solver: banded Cholesky. Buckling: subspace iteration on K·φ = λ·(−Kg)·φ.
+ * Element: 8-node hexahedron with incompatible modes (Wilson–Taylor), so coarse
+ * meshes still bend correctly; Taylor's correction keeps it exact for distorted
+ * (curved) elements in the patch test. Solver: banded Cholesky on an RCM-numbered
+ * mesh. Buckling: subspace iteration on K·φ = λ·(−Kg)·φ.
  */
 (function (root) {
   'use strict';
 
+  const FEMesh = typeof module !== 'undefined' && module.exports ? require('./mesh.js') : root.FEMesh;
+
   const GP = 1 / Math.sqrt(3);
-  // Local node order of the hexahedron (natural coordinates ξ, η, ζ ↔ x, y, z).
   const SIGNS = [
     [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
     [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
   ];
+  const GAUSS = SIGNS.map(s => s.map(v => v * GP));
+  // Extrapolation from Gauss points to corner nodes: EXTRAP[a][g].
+  const EXTRAP = SIGNS.map(sa => SIGNS.map(sg =>
+    (1 + sg[0] * sa[0] * Math.sqrt(3)) * (1 + sg[1] * sa[1] * Math.sqrt(3)) * (1 + sg[2] * sa[2] * Math.sqrt(3)) / 8));
 
-  // ---------- small dense matrix helpers ----------
+  // Tests offered for each specimen.
+  const SCENARIOS = {
+    rect: ['tension', 'compression', 'cantilever', 'threePoint', 'buckling', 'manual'],
+    dogbone: ['tension', 'manual'],
+    plate: ['tension', 'manual'],
+  };
+  const K_FACTOR = { 'fixed-free': 2, 'pinned-pinned': 1, 'fixed-pinned': 0.699, 'fixed-fixed': 0.5 };
+
+  // ---------- small dense helpers ----------
 
   function mat(r, c) {
     const m = [];
@@ -28,12 +41,10 @@
   function mul(A, B) {
     const r = A.length, k = B.length, c = B[0].length, C = mat(r, c);
     for (let i = 0; i < r; i++) {
-      const Ai = A[i], Ci = C[i];
       for (let l = 0; l < k; l++) {
-        const a = Ai[l];
+        const a = A[i][l];
         if (a === 0) continue;
-        const Bl = B[l];
-        for (let j = 0; j < c; j++) Ci[j] += a * Bl[j];
+        for (let j = 0; j < c; j++) C[i][j] += a * B[l][j];
       }
     }
     return C;
@@ -43,11 +54,6 @@
     const T = mat(A[0].length, A.length);
     for (let i = 0; i < A.length; i++) for (let j = 0; j < A[0].length; j++) T[j][i] = A[i][j];
     return T;
-  }
-
-  function addScaled(A, B, s) {
-    for (let i = 0; i < A.length; i++) for (let j = 0; j < A[0].length; j++) A[i][j] += s * B[i][j];
-    return A;
   }
 
   function invert(A) {
@@ -79,7 +85,6 @@
     return s;
   }
 
-  // Cholesky of a small SPD matrix: returns lower L with A = L·Lᵀ, or null.
   function cholesky(A) {
     const n = A.length, L = mat(n, n);
     for (let i = 0; i < n; i++) {
@@ -141,32 +146,9 @@
     const C = mul(mul(Li, Br), transpose(Li));
     for (let i = 0; i < n; i++) for (let j = 0; j < i; j++) C[i][j] = C[j][i] = 0.5 * (C[i][j] + C[j][i]);
     const { values, vectors } = jacobiEig(C);
-    const Q = mul(transpose(Li), vectors); // q = L⁻ᵀ z
+    const Q = mul(transpose(Li), vectors);
     const order = values.map((v, i) => i).sort((a, b) => values[b] - values[a]);
     return order.map(i => ({ mu: values[i], q: Q.map(r => r[i]) }));
-  }
-
-  // ---------- material and element ----------
-
-  function elasticity(E, nu) {
-    const c = E / ((1 + nu) * (1 - 2 * nu)), D = mat(6, 6);
-    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) D[i][j] = c * (i === j ? 1 - nu : nu);
-    for (let i = 3; i < 6; i++) D[i][i] = c * (1 - 2 * nu) / 2;
-    return D;
-  }
-
-  // Strain-displacement matrix from per-node gradients. Voigt order:
-  // εxx, εyy, εzz, γxy, γyz, γzx.
-  function bMatrix(grads) {
-    const B = mat(6, 3 * grads.length);
-    grads.forEach(([gx, gy, gz], a) => {
-      const c = 3 * a;
-      B[0][c] = gx; B[1][c + 1] = gy; B[2][c + 2] = gz;
-      B[3][c] = gy; B[3][c + 1] = gx;
-      B[4][c + 1] = gz; B[4][c + 2] = gy;
-      B[5][c] = gz; B[5][c + 2] = gx;
-    });
-    return B;
   }
 
   function vonMises(s) {
@@ -174,94 +156,124 @@
     return Math.sqrt(0.5 * ((sx - sy) ** 2 + (sy - sz) ** 2 + (sz - sx) ** 2) + 3 * (txy * txy + tyz * tyz + tzx * tzx));
   }
 
-  function boxElement(dx, dy, dz, D) {
-    const sc = [2 / dx, 2 / dy, 2 / dz], detJ = dx * dy * dz / 8;
-    const Kuu = mat(24, 24), Kua = mat(24, 9), Kaa = mat(9, 9);
-    const Bu = [], Ba = [], dN = [];
+  // ---------- element ----------
+
+  function shapeDerivs(p, out) {
+    for (let a = 0; a < 8; a++) {
+      const s = SIGNS[a];
+      const f0 = 1 + s[0] * p[0], f1 = 1 + s[1] * p[1], f2 = 1 + s[2] * p[2];
+      out[3 * a] = s[0] * f1 * f2 / 8;
+      out[3 * a + 1] = s[1] * f0 * f2 / 8;
+      out[3 * a + 2] = s[2] * f0 * f1 / 8;
+    }
+  }
+
+  // J[i][j] = ∂x_j/∂ξ_i (row-major). Writes J⁻¹ into inv and returns det J.
+  function jacobian(X, dN, J, inv) {
+    J.fill(0);
+    for (let a = 0; a < 8; a++) {
+      for (let i = 0; i < 3; i++) {
+        const d = dN[3 * a + i];
+        J[3 * i] += d * X[3 * a];
+        J[3 * i + 1] += d * X[3 * a + 1];
+        J[3 * i + 2] += d * X[3 * a + 2];
+      }
+    }
+    const [a, b, c, d, e, f, g, h, k] = J;
+    const det = a * (e * k - f * h) - b * (d * k - f * g) + c * (d * h - e * g);
+    inv[0] = (e * k - f * h) / det; inv[1] = (c * h - b * k) / det; inv[2] = (b * f - c * e) / det;
+    inv[3] = (f * g - d * k) / det; inv[4] = (a * k - c * g) / det; inv[5] = (c * d - a * f) / det;
+    inv[6] = (d * h - e * g) / det; inv[7] = (b * g - a * h) / det; inv[8] = (a * e - b * d) / det;
+    return det;
+  }
+
+  const INVERTED = 'Mesh error: an element is turned inside out. Check the specimen dimensions.';
+
+  // Gradients of the 8 shape functions and the 3 incompatible modes at each Gauss point:
+  // G[g·33 + 3·a + r], a = 0..10 (8 nodes, then 3 modes).
+  function elementGrads(X) {
+    const G = new Float64Array(8 * 33), detJ = new Float64Array(8);
+    const dN = new Float64Array(24), J = new Float64Array(9), inv = new Float64Array(9), inv0 = new Float64Array(9);
+    shapeDerivs([0, 0, 0], dN);
+    const det0 = jacobian(X, dN, J, inv0);
+    if (!(det0 > 0)) throw new Error(INVERTED);
     for (let g = 0; g < 8; g++) {
-      const p = SIGNS[g].map(s => s * GP);
-      const grads = SIGNS.map(s => [0, 1, 2].map(d => {
-        let v = s[d] * sc[d] / 8;
-        for (let e = 0; e < 3; e++) if (e !== d) v *= 1 + s[e] * p[e];
-        return v;
-      }));
-      // Incompatible modes (1 − ξk²) for each direction k, per displacement component.
-      const inc = [0, 1, 2].map(k => [0, 1, 2].map(d => (d === k ? -2 * p[k] * sc[k] : 0)));
-      const bu = bMatrix(grads), ba = bMatrix(inc);
-      const dbu = mul(D, bu), dba = mul(D, ba), but = transpose(bu);
-      addScaled(Kuu, mul(but, dbu), detJ);
-      addScaled(Kua, mul(but, dba), detJ);
-      addScaled(Kaa, mul(transpose(ba), dba), detJ);
-      Bu.push(bu); Ba.push(ba); dN.push(grads);
-    }
-    // Static condensation of the internal modes: α = R·u.
-    const R = addScaled(mat(9, 24), mul(invert(Kaa), transpose(Kua)), -1);
-    const K = addScaled(Kuu.map(r => Float64Array.from(r)), mul(Kua, R), 1);
-    for (let i = 0; i < 24; i++) for (let j = 0; j < i; j++) K[i][j] = K[j][i] = 0.5 * (K[i][j] + K[j][i]);
-
-    // Stress operators at Gauss points, extrapolated to the corner nodes.
-    const Sg = Bu.map((bu, g) => mul(D, addScaled(bu.map(r => Float64Array.from(r)), mul(Ba[g], R), 1)));
-    const r3 = Math.sqrt(3);
-    const Sn = SIGNS.map(sa => {
-      const S = mat(6, 24);
-      SIGNS.forEach((sg, g) => {
-        const w = (1 + sg[0] * sa[0] * r3) * (1 + sg[1] * sa[1] * r3) * (1 + sg[2] * sa[2] * r3) / 8;
-        addScaled(S, Sg[g], w);
-      });
-      return S;
-    });
-    const Sc = mat(6, 24);
-    Sg.forEach(S => addScaled(Sc, S, 1 / 8));
-
-    // Geometric stiffness kernels: Gk[3p+q][a][b] = ∫ ∂Na/∂xp · ∂Nb/∂xq dV.
-    const Gk = [];
-    for (let p = 0; p < 3; p++) {
-      for (let q = 0; q < 3; q++) {
-        const m = mat(8, 8);
-        for (let g = 0; g < 8; g++) {
-          for (let a = 0; a < 8; a++) for (let b = 0; b < 8; b++) m[a][b] += dN[g][a][p] * dN[g][b][q] * detJ;
-        }
-        Gk.push(m);
+      const p = GAUSS[g];
+      shapeDerivs(p, dN);
+      const det = jacobian(X, dN, J, inv);
+      if (!(det > 0)) throw new Error(INVERTED);
+      detJ[g] = det;
+      const base = 33 * g;
+      for (let a = 0; a < 8; a++) {
+        const x0 = dN[3 * a], x1 = dN[3 * a + 1], x2 = dN[3 * a + 2];
+        for (let r = 0; r < 3; r++) G[base + 3 * a + r] = inv[3 * r] * x0 + inv[3 * r + 1] * x1 + inv[3 * r + 2] * x2;
+      }
+      // Incompatible modes (1 − ξk²): Taylor's form uses J at the centre, scaled by det J0 / det J.
+      const sc = det0 / det;
+      for (let k = 0; k < 3; k++) {
+        const d = -2 * p[k] * sc;
+        for (let r = 0; r < 3; r++) G[base + 3 * (8 + k) + r] = inv0[3 * r + k] * d;
       }
     }
-    return { K, Sn, Sc, Gk };
+    return { G, detJ };
   }
 
-  // ---------- mesh ----------
-
-  function buildMesh(p) {
-    const { L, b, h, nx, ny, nz } = p;
-    const NY = ny + 1, NZ = nz + 1, NS = NY * NZ, nn = (nx + 1) * NS;
-    const id = (i, j, k) => i * NS + k * NY + j;
-    const xyz = new Float64Array(3 * nn);
-    for (let i = 0; i <= nx; i++) {
-      for (let k = 0; k <= nz; k++) {
-        for (let j = 0; j <= ny; j++) {
-          const n = id(i, j, k);
-          xyz[3 * n] = L * i / nx;
-          xyz[3 * n + 1] = -b / 2 + b * j / ny;
-          xyz[3 * n + 2] = -h / 2 + h * k / nz;
+  // Condensed 24×24 stiffness and the internal-mode recovery matrix R (α = R·u).
+  function elementStiffness(X, lam, mu) {
+    const { G, detJ } = elementGrads(X), N = 33, K = new Float64Array(N * N);
+    for (let g = 0; g < 8; g++) {
+      const w = detJ[g], base = 33 * g;
+      for (let a = 0; a < 11; a++) {
+        const ax = G[base + 3 * a], ay = G[base + 3 * a + 1], az = G[base + 3 * a + 2], ga = [ax, ay, az];
+        for (let b = 0; b < 11; b++) {
+          const bx = G[base + 3 * b], by = G[base + 3 * b + 1], bz = G[base + 3 * b + 2], gb = [bx, by, bz];
+          const dd = mu * (ax * bx + ay * by + az * bz);
+          for (let i = 0; i < 3; i++) {
+            const row = (3 * a + i) * N + 3 * b;
+            for (let j = 0; j < 3; j++) K[row + j] += w * (lam * ga[i] * gb[j] + mu * ga[j] * gb[i] + (i === j ? dd : 0));
+          }
         }
       }
     }
-    const ne = nx * ny * nz, conn = new Int32Array(8 * ne);
-    let e = 0;
-    for (let i = 0; i < nx; i++) {
-      for (let k = 0; k < nz; k++) {
-        for (let j = 0; j < ny; j++, e++) {
-          SIGNS.forEach((s, a) => {
-            conn[8 * e + a] = id(i + (s[0] > 0), j + (s[1] > 0), k + (s[2] > 0));
-          });
-        }
+    const K22 = mat(9, 9);
+    for (let i = 0; i < 9; i++) for (let j = 0; j < 9; j++) K22[i][j] = K[(24 + i) * N + 24 + j];
+    const K22i = invert(K22), R = new Float64Array(9 * 24);
+    for (let i = 0; i < 9; i++) {
+      for (let c = 0; c < 24; c++) {
+        let s = 0;
+        for (let j = 0; j < 9; j++) s += K22i[i][j] * K[(24 + j) * N + c];
+        R[24 * i + c] = -s;
       }
     }
-    return { L, b, h, nx, ny, nz, NY, NZ, NS, nn, ne, xyz, conn, id, dx: L / nx, dy: b / ny, dz: h / nz };
+    const Kc = new Float64Array(576);
+    for (let r = 0; r < 24; r++) {
+      for (let c = 0; c < 24; c++) {
+        let s = K[r * N + c];
+        for (let i = 0; i < 9; i++) s += K[r * N + 24 + i] * R[24 * i + c];
+        Kc[24 * r + c] = s;
+      }
+    }
+    for (let r = 0; r < 24; r++) for (let c = 0; c < r; c++) Kc[24 * r + c] = Kc[24 * c + r] = 0.5 * (Kc[24 * r + c] + Kc[24 * c + r]);
+    return { K: Kc, R, G, detJ };
   }
 
-  function faceNodes(mesh, i) {
-    const out = [];
-    for (let k = 0; k <= mesh.nz; k++) for (let j = 0; j <= mesh.ny; j++) out.push(mesh.id(i, j, k));
-    return out;
+  // Stresses at the 8 Gauss points from element displacements ue (24) and modes α (9).
+  function gaussStresses(G, ue, alpha, lam, mu, out) {
+    for (let g = 0; g < 8; g++) {
+      let exx = 0, eyy = 0, ezz = 0, gxy = 0, gyz = 0, gzx = 0;
+      const base = 33 * g;
+      for (let a = 0; a < 11; a++) {
+        const gx = G[base + 3 * a], gy = G[base + 3 * a + 1], gz = G[base + 3 * a + 2];
+        const ux = a < 8 ? ue[3 * a] : alpha[3 * (a - 8)];
+        const uy = a < 8 ? ue[3 * a + 1] : alpha[3 * (a - 8) + 1];
+        const uz = a < 8 ? ue[3 * a + 2] : alpha[3 * (a - 8) + 2];
+        exx += gx * ux; eyy += gy * uy; ezz += gz * uz;
+        gxy += gy * ux + gx * uy; gyz += gz * uy + gy * uz; gzx += gx * uz + gz * ux;
+      }
+      const tr = lam * (exx + eyy + ezz), o = 6 * g;
+      out[o] = tr + 2 * mu * exx; out[o + 1] = tr + 2 * mu * eyy; out[o + 2] = tr + 2 * mu * ezz;
+      out[o + 3] = mu * gxy; out[o + 4] = mu * gyz; out[o + 5] = mu * gzx;
+    }
   }
 
   // ---------- banded symmetric matrix (upper band storage) ----------
@@ -316,7 +328,7 @@
           let s = a[i * W + j - i];
           for (let k = Math.max(0, j - w); k < i; k++) s -= a[k * W + i - k] * a[k * W + j - k];
           if (j === i) {
-            if (!(s > 0)) throw new Error('The model is not held in place (stiffness matrix is singular). Check the supports.');
+            if (!(s > 0)) throw new Error('The specimen is not held in place: it can slide or rotate. Check the supports.');
             a[i * W] = Math.sqrt(s);
           } else a[i * W + j - i] = s / a[i * W];
         }
@@ -340,113 +352,189 @@
     }
   }
 
-  function assembleK(mesh, el, w) {
-    const K = new Band(3 * mesh.nn, w), dofs = new Int32Array(24), { a, W } = K;
+  function bandwidth(mesh) {
+    let w = 0;
     for (let e = 0; e < mesh.ne; e++) {
+      let lo = Infinity, hi = -Infinity;
+      for (let a = 0; a < 8; a++) {
+        const n = mesh.conn[8 * e + a];
+        lo = Math.min(lo, n);
+        hi = Math.max(hi, n);
+      }
+      w = Math.max(w, hi - lo);
+    }
+    return 3 * w + 2;
+  }
+
+  function gatherX(mesh, e, X) {
+    for (let a = 0; a < 8; a++) {
+      const n = mesh.conn[8 * e + a];
+      X[3 * a] = mesh.xyz[3 * n]; X[3 * a + 1] = mesh.xyz[3 * n + 1]; X[3 * a + 2] = mesh.xyz[3 * n + 2];
+    }
+    return X;
+  }
+
+  function assemble(mesh, lam, mu, w) {
+    const K = new Band(3 * mesh.nn, w), { a, W } = K, dofs = new Int32Array(24), X = new Float64Array(24);
+    const cache = { R: new Float64Array(216 * mesh.ne), G: new Float64Array(264 * mesh.ne), detJ: new Float64Array(8 * mesh.ne) };
+    for (let e = 0; e < mesh.ne; e++) {
+      const el = elementStiffness(gatherX(mesh, e, X), lam, mu);
+      cache.R.set(el.R, 216 * e);
+      cache.G.set(el.G, 264 * e);
+      cache.detJ.set(el.detJ, 8 * e);
       for (let n = 0; n < 8; n++) {
         const node = mesh.conn[8 * e + n];
         for (let c = 0; c < 3; c++) dofs[3 * n + c] = 3 * node + c;
       }
       for (let r = 0; r < 24; r++) {
-        const Kr = el.K[r], gr = dofs[r];
+        const gr = dofs[r];
         for (let c = 0; c < 24; c++) {
           const gc = dofs[c];
-          if (gc >= gr) a[gr * W + gc - gr] += Kr[c];
+          if (gc >= gr) a[gr * W + gc - gr] += el.K[24 * r + c];
         }
       }
     }
-    return K;
+    return { K, cache };
   }
 
-  // ---------- test setups: supports and loads ----------
+  // ---------- node sets ----------
 
-  // Uniform traction on the end face x = x(i), total force F = [fx, fy, fz].
-  function faceLoad(mesh, i, F, f) {
-    const q = 1 / (mesh.ny * mesh.nz * 4);
-    for (let k = 0; k < mesh.nz; k++) {
-      for (let j = 0; j < mesh.ny; j++) {
-        for (const [dj, dk] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
-          const n = mesh.id(i, j + dj, k + dk);
-          for (let c = 0; c < 3; c++) f[3 * n + c] += F[c] * q;
+  function nodeTools(mesh) {
+    const { xyz, nn } = mesh, tol = 1e-6 * mesh.L;
+    const where = pred => {
+      const out = [];
+      for (let i = 0; i < nn; i++) if (pred(xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 2])) out.push(i);
+      return out;
+    };
+    const plane = X => where(x => Math.abs(x - X) < tol);
+    const line = (X, Z) => where((x, y, z) => Math.abs(x - X) < tol && Math.abs(z - Z) < tol);
+    const nearest = (X, Y, Z) => {
+      let best = 0, bd = Infinity;
+      for (let i = 0; i < nn; i++) {
+        const d = (xyz[3 * i] - X) ** 2 + (xyz[3 * i + 1] - Y) ** 2 + (xyz[3 * i + 2] - Z) ** 2;
+        if (d < bd) { bd = d; best = i; }
+      }
+      return best;
+    };
+
+    // Area share of each node on the plane x = X (uniform traction), weights sum to 1.
+    const planeWeights = X => {
+      const seen = new Set(), wts = new Map();
+      let total = 0;
+      const inPlane = n => Math.abs(xyz[3 * n] - X) < tol;
+      for (let e = 0; e < mesh.ne; e++) {
+        for (const f of FEMesh.HEX_FACES) {
+          const q = f.map(a => mesh.conn[8 * e + a]);
+          if (!q.every(inPlane)) continue;
+          const key = [...q].sort((a, b) => a - b).join(',');
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const P = i => [xyz[3 * q[i]], xyz[3 * q[i] + 1], xyz[3 * q[i] + 2]];
+          const d1 = P(2).map((v, c) => v - P(0)[c]), d2 = P(3).map((v, c) => v - P(1)[c]);
+          const area = 0.5 * Math.hypot(d1[1] * d2[2] - d1[2] * d2[1], d1[2] * d2[0] - d1[0] * d2[2], d1[0] * d2[1] - d1[1] * d2[0]);
+          total += area;
+          q.forEach(n => wts.set(n, (wts.get(n) || 0) + area / 4));
         }
       }
-    }
+      wts.forEach((v, k) => wts.set(k, v / total));
+      return { wts, area: total };
+    };
+
+    // Length share of each node on the line x = X, z = Z (across the width), weights sum to 1.
+    const lineWeights = (X, Z) => {
+      const ns = line(X, Z).sort((a, b) => xyz[3 * a + 1] - xyz[3 * b + 1]), wts = new Map();
+      const y = n => xyz[3 * n + 1], span = y(ns[ns.length - 1]) - y(ns[0]);
+      ns.forEach((n, i) => {
+        const lo = i > 0 ? (y(n) - y(ns[i - 1])) / 2 : 0, hi = i < ns.length - 1 ? (y(ns[i + 1]) - y(n)) / 2 : 0;
+        wts.set(n, (lo + hi) / span);
+      });
+      return wts;
+    };
+
+    return { where, plane, line, nearest, planeWeights, lineWeights, tol };
   }
 
-  // Line load across the width at slice i, height level k.
-  function lineLoad(mesh, i, k, F, f) {
-    const q = 1 / (mesh.ny * 2);
-    for (let j = 0; j < mesh.ny; j++) {
-      for (const n of [mesh.id(i, j, k), mesh.id(i, j + 1, k)]) {
-        for (let c = 0; c < 3; c++) f[3 * n + c] += F[c] * q;
-      }
-    }
-  }
+  // ---------- supports and loads ----------
 
-  function forceVector(p) {
-    if (p.test !== 'cantilever') return null;
-    const a = p.alpha * Math.PI / 180, b = p.beta * Math.PI / 180, F = p.F;
-    // α: angle from the beam axis (+x). β: rotation around the axis, 0° = downward (−z), 90° = +y.
+  function forceVector(F, alpha, beta) {
+    const a = alpha * Math.PI / 180, b = beta * Math.PI / 180;
+    // α: angle from the specimen axis (+x). β: rotation around the axis, 0° = downward (−z), 90° = +y.
     const clean = v => (Math.abs(v) < 1e-12 * F ? 0 : v); // cos(90°) is not exactly 0 in floating point
     return [F * Math.cos(a), F * Math.sin(a) * Math.sin(b), -F * Math.sin(a) * Math.cos(b)].map(clean);
   }
 
-  function setup(mesh, p) {
-    const { nx, ny, nz, id } = mesh, jc = ny / 2, kc = nz / 2;
-    const fix = [], ties = [], f = new Float64Array(3 * mesh.nn);
+  function manualStable(start, end) {
+    const pinOrRoller = s => s === 'pinned' || s === 'roller';
+    return start === 'fixed' || end === 'fixed' ||
+      (start === 'pinned' && pinOrRoller(end)) || (end === 'pinned' && pinOrRoller(start));
+  }
+
+  function setup(mesh, p, T) {
+    const L = mesh.L, zt = mesh.t / 2, f = new Float64Array(3 * mesh.nn), fix = [], ties = [];
     const pin = (n, comps) => comps.forEach(c => fix.push(3 * n + c));
-    const clamp = i => faceNodes(mesh, i).forEach(n => pin(n, [0, 1, 2]));
-    switch (p.test) {
+    const clamp = X => T.plane(X).forEach(n => pin(n, [0, 1, 2]));
+    const addLoad = (wts, F) => wts.forEach((w, n) => { for (let c = 0; c < 3; c++) f[3 * n + c] += F[c] * w; });
+    const planeLoad = (X, F) => addLoad(T.planeWeights(X).wts, F);
+    // Edge node at mid-thickness on the end face: stops the specimen twisting about x.
+    const twistNode = X => {
+      const ns = T.line(X, 0);
+      return ns.reduce((best, n) => (mesh.xyz[3 * n + 1] > mesh.xyz[3 * best + 1] ? n : best), ns[0]);
+    };
+    const support = (X, type) => {
+      if (type === 'fixed') clamp(X);
+      else if (type === 'pinned') T.line(X, 0).forEach(n => pin(n, [0, 1, 2]));
+      else if (type === 'roller') T.line(X, 0).forEach(n => pin(n, [2]));
+    };
+
+    switch (p.scenario) {
       case 'tension':
       case 'compression': {
         // Ideal grips: end face held axially, free to contract sideways.
-        const s = p.test === 'tension' ? 1 : -1;
-        faceNodes(mesh, 0).forEach(n => pin(n, [0]));
-        pin(id(0, jc, kc), [1, 2]);
-        pin(id(0, ny, kc), [2]);
-        faceLoad(mesh, nx, [s * p.F, 0, 0], f);
+        const s = p.scenario === 'tension' ? 1 : -1;
+        T.plane(0).forEach(n => pin(n, [0]));
+        pin(T.nearest(0, 0, 0), [1, 2]);
+        pin(twistNode(0), [2]);
+        planeLoad(L, [s * p.F, 0, 0]);
         break;
       }
       case 'cantilever':
         clamp(0);
-        faceLoad(mesh, nx, forceVector(p), f);
+        planeLoad(L, [0, 0, -p.F]);
         break;
       case 'threePoint':
-        for (let j = 0; j <= ny; j++) {
-          pin(id(0, j, 0), [0, 2]);
-          pin(id(nx, j, 0), [2]);
-        }
-        pin(id(0, jc, 0), [1]);
-        pin(id(nx, jc, 0), [1]);
-        lineLoad(mesh, nx / 2, nz, [0, 0, -p.F], f);
+        T.line(0, -zt).forEach(n => pin(n, [0, 2]));
+        T.line(L, -zt).forEach(n => pin(n, [2]));
+        pin(T.nearest(0, 0, -zt), [1]);
+        pin(T.nearest(L, 0, -zt), [1]);
+        addLoad(T.lineWeights(L / 2, zt), [0, 0, -p.F]);
         break;
       case 'buckling': {
-        const P = [-p.F, 0, 0];
+        const P = [-p.F, 0, 0], c0 = T.nearest(0, 0, 0), cL = T.nearest(L, 0, 0);
         switch (p.ends) {
           case 'fixed-free':
             clamp(0);
-            faceLoad(mesh, nx, P, f);
+            planeLoad(L, P);
             break;
           case 'pinned-pinned':
             // Equal and opposite end loads; supports only stop rigid-body motion.
-            pin(id(0, jc, kc), [0, 1, 2]);
-            pin(id(0, ny, kc), [2]);
-            pin(id(nx, jc, kc), [1, 2]);
-            faceLoad(mesh, 0, [p.F, 0, 0], f);
-            faceLoad(mesh, nx, P, f);
+            pin(c0, [0, 1, 2]);
+            pin(twistNode(0), [2]);
+            pin(cL, [1, 2]);
+            planeLoad(0, [p.F, 0, 0]);
+            planeLoad(L, P);
             break;
           case 'fixed-pinned':
             clamp(0);
-            pin(id(nx, jc, kc), [1, 2]);
-            faceLoad(mesh, nx, P, f);
+            pin(cL, [1, 2]);
+            planeLoad(L, P);
             break;
           case 'fixed-fixed': {
             // Loaded end stays flat (axial tie) and cannot move sideways.
             clamp(0);
-            const face = faceNodes(mesh, nx), master = id(nx, jc, kc);
+            const face = T.plane(L);
             face.forEach(n => pin(n, [1, 2]));
-            ties.push({ master: 3 * master, slaves: face.filter(n => n !== master).map(n => 3 * n) });
-            faceLoad(mesh, nx, P, f);
+            ties.push({ master: 3 * cL, slaves: face.filter(n => n !== cL).map(n => 3 * n) });
+            planeLoad(L, P);
             break;
           }
           default:
@@ -454,29 +542,58 @@
         }
         break;
       }
+      case 'manual': {
+        const m = p.manual;
+        if (!manualStable(m.start, m.end)) {
+          throw new Error('These supports do not hold the specimen in place: it can slide or rotate. Use at least one Fixed end, or Pinned with Pinned or Roller.');
+        }
+        const X = { start: 0, mid: L / 2, end: L }[m.at];
+        if ((m.at === 'start' && m.start === 'fixed') || (m.at === 'end' && m.end === 'fixed')) {
+          throw new Error('The force is applied on a fixed end, so it would go straight into the support. Move the force or change that support.');
+        }
+        support(0, m.start);
+        support(L, m.end);
+        planeLoad(X, forceVector(p.F, m.alpha, m.beta));
+        break;
+      }
       default:
-        throw new Error('Unknown test: ' + p.test);
+        throw new Error('Unknown test: ' + p.scenario);
     }
     return { fix, ties, f };
   }
 
   // ---------- post-processing ----------
 
-  function stresses(mesh, el, u) {
+  function stresses(mesh, cache, u, lam, mu) {
     const { nn, ne, conn } = mesh;
     const sn = new Float64Array(6 * nn), cnt = new Float64Array(nn), se = new Float64Array(6 * ne);
-    const ue = new Float64Array(24);
+    const ue = new Float64Array(24), alpha = new Float64Array(9), sg = new Float64Array(48);
     for (let e = 0; e < ne; e++) {
       for (let a = 0; a < 8; a++) {
         const node = conn[8 * e + a];
         for (let c = 0; c < 3; c++) ue[3 * a + c] = u[3 * node + c];
       }
+      const R = cache.R.subarray(216 * e, 216 * e + 216);
+      for (let i = 0; i < 9; i++) {
+        let s = 0;
+        for (let c = 0; c < 24; c++) s += R[24 * i + c] * ue[c];
+        alpha[i] = s;
+      }
+      gaussStresses(cache.G.subarray(264 * e, 264 * e + 264), ue, alpha, lam, mu, sg);
       for (let a = 0; a < 8; a++) {
-        const node = conn[8 * e + a], S = el.Sn[a];
-        for (let r = 0; r < 6; r++) sn[6 * node + r] += dot(S[r], ue);
+        const node = conn[8 * e + a];
+        for (let r = 0; r < 6; r++) {
+          let s = 0;
+          for (let g = 0; g < 8; g++) s += EXTRAP[a][g] * sg[6 * g + r];
+          sn[6 * node + r] += s;
+        }
         cnt[node]++;
       }
-      for (let r = 0; r < 6; r++) se[6 * e + r] = dot(el.Sc[r], ue);
+      for (let r = 0; r < 6; r++) {
+        let s = 0;
+        for (let g = 0; g < 8; g++) s += sg[6 * g + r];
+        se[6 * e + r] = s / 8;
+      }
     }
     const vm = new Float64Array(nn);
     for (let n = 0; n < nn; n++) {
@@ -496,17 +613,22 @@
     return x;
   }
 
-  function buckle(mesh, el, K, fixed, se, w) {
-    const n = 3 * mesh.nn, B = new Band(n, w), { a, W } = B;
-    const m = mat(8, 8);
+  function buckle(mesh, cache, K, fixed, se, w) {
+    const n = 3 * mesh.nn, B = new Band(n, w), { a, W } = B, m = mat(8, 8);
     for (let e = 0; e < mesh.ne; e++) {
       const [sx, sy, sz, txy, tyz, tzx] = se.subarray(6 * e, 6 * e + 6);
-      const S = [sx, txy, tzx, txy, sy, tyz, tzx, tyz, sz];
+      const S = [[sx, txy, tzx], [txy, sy, tyz], [tzx, tyz, sz]];
+      const G = cache.G.subarray(264 * e, 264 * e + 264), detJ = cache.detJ.subarray(8 * e, 8 * e + 8);
       for (let i = 0; i < 8; i++) m[i].fill(0);
-      for (let pq = 0; pq < 9; pq++) {
-        if (S[pq] === 0) continue;
-        const G = el.Gk[pq];
-        for (let i = 0; i < 8; i++) for (let j = 0; j < 8; j++) m[i][j] += S[pq] * G[i][j];
+      for (let g = 0; g < 8; g++) {
+        const base = 33 * g;
+        for (let i = 0; i < 8; i++) {
+          const gi = [G[base + 3 * i], G[base + 3 * i + 1], G[base + 3 * i + 2]];
+          const Sg = [0, 1, 2].map(q => S[0][q] * gi[0] + S[1][q] * gi[1] + S[2][q] * gi[2]);
+          for (let j = 0; j < 8; j++) {
+            m[i][j] += detJ[g] * (Sg[0] * G[base + 3 * j] + Sg[1] * G[base + 3 * j + 1] + Sg[2] * G[base + 3 * j + 2]);
+          }
+        }
       }
       for (let i = 0; i < 8; i++) {
         const ni = mesh.conn[8 * e + i];
@@ -521,15 +643,12 @@
     }
     for (let d = 0; d < n; d++) if (fixed[d]) B.constrain(d, 0);
 
-    const p = Math.min(4, n);
-    const Bmv = x => B.matvec(x);
+    const p = Math.min(4, n), Bmv = x => B.matvec(x);
     let X = [];
     for (let c = 0; c < p; c++) X.push(seeded(n, c, fixed));
     let pairs = null, prev = Infinity, iters = 0;
     for (let it = 0; it < 80; it++, iters++) {
-      const BX = X.map(Bmv);
-      const Y = BX.map(bx => K.solve(bx));
-      const BY = Y.map(Bmv);
+      const BX = X.map(Bmv), Y = BX.map(bx => K.solve(bx)), BY = Y.map(Bmv);
       const Kr = mat(p, p), Br = mat(p, p);
       for (let i = 0; i < p; i++) {
         for (let j = 0; j < p; j++) {
@@ -547,9 +666,9 @@
         if (mx > 0) for (let k = 0; k < n; k++) x[k] /= mx;
         return x;
       });
-      const mu = pairs[0].mu;
-      if (mu > 0 && Math.abs(1 / mu - prev) < 1e-8 * Math.abs(prev)) break;
-      prev = mu > 0 ? 1 / mu : Infinity;
+      const mu0 = pairs[0].mu;
+      if (mu0 > 0 && Math.abs(1 / mu0 - prev) < 1e-8 * Math.abs(prev)) break;
+      prev = mu0 > 0 ? 1 / mu0 : Infinity;
     }
     if (!pairs || !(pairs[0].mu > 0)) return { factor: null, mode: null, iterations: iters };
     return {
@@ -560,83 +679,102 @@
     };
   }
 
-  // ---------- hand calculations (beam theory) ----------
+  // ---------- hand calculations ----------
 
-  const K_FACTOR = { 'fixed-free': 2, 'pinned-pinned': 1, 'fixed-pinned': 0.699, 'fixed-fixed': 0.5 };
+  // Stress concentration factor of a central hole in a finite-width plate under tension,
+  // based on the net-section stress (Heywood / Peterson fit, valid for d/W ≤ 0.65).
+  function ktHole(dW) {
+    return 3 - 3.14 * dW + 3.667 * dW ** 2 - 1.527 * dW ** 3;
+  }
 
-  function sectionProps(p) {
-    const A = p.b * p.h, Iy = p.b * p.h ** 3 / 12, Iz = p.h * p.b ** 3 / 12;
+  function sectionProps(b, h) {
+    const A = b * h, Iy = b * h ** 3 / 12, Iz = h * b ** 3 / 12;
     return { A, Iy, Iz, Imin: Math.min(Iy, Iz) };
   }
 
-  // Normal stress |σx| from beam theory at position x along the beam.
-  function handStress(p, x) {
-    const { A, Iy, Iz } = sectionProps(p);
-    switch (p.test) {
-      case 'tension':
-      case 'compression':
-      case 'buckling':
-        return p.F / A;
-      case 'cantilever': {
-        const [fx, fy, fz] = forceVector(p), arm = p.L - x;
-        return Math.abs(fx) / A + Math.abs(fz) * arm * (p.h / 2) / Iy + Math.abs(fy) * arm * (p.b / 2) / Iz;
-      }
-      case 'threePoint':
-        return (p.F / 2) * Math.min(x, p.L - x) * (p.h / 2) / Iy;
-      default:
-        return NaN;
-    }
-  }
-
+  // Hand-calc comparison values; null for the manual setup.
   function hand(p, xProbe) {
-    const { A, Iy, Iz, Imin } = sectionProps(p), E = p.E, L = p.L;
-    const out = { A, Iy, Iz, sigmaProbe: handStress(p, xProbe) };
-    switch (p.test) {
+    const E = p.E, F = p.F, d = p.dims;
+    if (p.scenario === 'manual') return null;
+
+    if (p.geometry === 'dogbone') {
+      const s = FEMesh.dogboneShape(d), A = d.gaugeWidth * d.t;
+      // Bar of varying width: δ = F/(E·t)·∫dx / w(x).
+      let integral = 0;
+      const N = 4000;
+      for (let i = 0; i < N; i++) integral += (d.L / N) / s.width((i + 0.5) * d.L / N);
+      return {
+        A, sigmaMax: F / A, sigmaMaxNote: 'σ = F / (b·t) in the gauge section',
+        sigmaProbe: F / (s.width(xProbe) * d.t),
+        delta: F * integral / (E * d.t), deltaLabel: 'Total elongation',
+      };
+    }
+
+    if (p.geometry === 'plate') {
+      const dW = d.d / d.W, Kt = ktHole(dW), sNom = F / ((d.W - d.d) * d.t), cx = d.L / 2;
+      const atHole = Math.abs(xProbe - cx) < 1e-6 * d.L;
+      return {
+        A: d.W * d.t, Kt, sigmaNom: sNom,
+        sigmaMax: Kt * sNom, sigmaMaxNote: 'Kt · σnom at the hole edge',
+        sigmaProbe: atHole ? Kt * sNom : F / (d.W * d.t),
+        probeNote: atHole ? 'hole edge: Kt · σnom' : 'far from the hole: F / (W·t)',
+        delta: F * d.L / (E * d.W * d.t), deltaLabel: 'Elongation (ignoring the hole)',
+      };
+    }
+
+    const { A, Iy, Iz, Imin } = sectionProps(d.b, d.h), L = d.L;
+    switch (p.scenario) {
       case 'tension':
       case 'compression':
-        out.sigmaMax = p.F / A;
-        out.delta = p.F * L / (E * A);
-        out.deltaLabel = p.test === 'tension' ? 'Elongation' : 'Shortening';
-        // Platens hold both ends: treat as a fixed–fixed column.
-        out.Pcr = Math.PI ** 2 * E * Imin / (0.5 * L) ** 2;
-        break;
-      case 'cantilever': {
-        const [fx, fy, fz] = forceVector(p);
-        out.sigmaMax = handStress(p, 0);
-        out.delta = Math.hypot(fx * L / (E * A), fz * L ** 3 / (3 * E * Iy), fy * L ** 3 / (3 * E * Iz));
-        out.deltaLabel = 'Tip deflection';
-        break;
-      }
+        return {
+          A, Iy, Iz, sigmaMax: F / A, sigmaMaxNote: 'σ = F / A', sigmaProbe: F / A,
+          delta: F * L / (E * A), deltaLabel: p.scenario === 'tension' ? 'Elongation' : 'Shortening',
+          // Platens hold both ends: treat as a fixed–fixed column.
+          Pcr: Math.PI ** 2 * E * Imin / (0.5 * L) ** 2,
+        };
+      case 'cantilever':
+        return {
+          A, Iy, Iz, sigmaMax: F * L * (d.h / 2) / Iy, sigmaMaxNote: 'σ = M·c / I at the clamp',
+          sigmaProbe: F * (L - xProbe) * (d.h / 2) / Iy,
+          delta: F * L ** 3 / (3 * E * Iy), deltaLabel: 'Tip deflection',
+        };
       case 'threePoint':
-        out.sigmaMax = handStress(p, L / 2);
-        out.delta = p.F * L ** 3 / (48 * E * Iy);
-        out.deltaLabel = 'Mid-span deflection';
-        break;
+        return {
+          A, Iy, Iz, sigmaMax: (F / 2) * (L / 2) * (d.h / 2) / Iy, sigmaMaxNote: 'σ = M·c / I at mid-span',
+          sigmaProbe: (F / 2) * Math.min(xProbe, L - xProbe) * (d.h / 2) / Iy,
+          delta: F * L ** 3 / (48 * E * Iy), deltaLabel: 'Mid-span deflection',
+        };
       case 'buckling': {
-        const Kf = K_FACTOR[p.ends], r = Math.sqrt(Imin / A);
-        out.K = Kf;
-        out.Pcr = Math.PI ** 2 * E * Imin / (Kf * L) ** 2;
-        out.slenderness = Kf * L / r;
-        out.sigmaMax = p.F / A;
-        out.delta = p.F * L / (E * A);
-        out.deltaLabel = 'Shortening';
-        break;
+        const Kf = K_FACTOR[p.ends];
+        return {
+          A, Iy, Iz, K: Kf, Pcr: Math.PI ** 2 * E * Imin / (Kf * L) ** 2,
+          slenderness: Kf * L / Math.sqrt(Imin / A),
+          sigmaMax: F / A, sigmaMaxNote: 'σ = P / A', sigmaProbe: F / A,
+          delta: F * L / (E * A), deltaLabel: 'Shortening',
+        };
       }
+      default:
+        return null;
     }
-    return out;
   }
 
   // ---------- main entry ----------
 
+  function now() {
+    return (typeof performance !== 'undefined' ? performance : Date).now();
+  }
+
   function analyze(p) {
-    const t0 = (typeof performance !== 'undefined' ? performance : Date).now();
-    const mesh = buildMesh(p);
-    const D = elasticity(p.E, p.nu);
-    const el = boxElement(mesh.dx, mesh.dy, mesh.dz, D);
-    const w = 3 * (mesh.NS + mesh.NY + 1) + 2;
-    const n = 3 * mesh.nn;
-    const K = assembleK(mesh, el, w);
-    const { fix, ties, f } = setup(mesh, p);
+    const t0 = now();
+    if (!SCENARIOS[p.geometry] || !SCENARIOS[p.geometry].includes(p.scenario)) {
+      throw new Error(`The ${p.scenario} test is not available for this specimen.`);
+    }
+    const mesh = FEMesh.build(p.geometry, p.dims, p.density);
+    const lam = p.E * p.nu / ((1 + p.nu) * (1 - 2 * p.nu)), mu = p.E / (2 * (1 + p.nu));
+    const w = bandwidth(mesh), n = 3 * mesh.nn;
+    const { K, cache } = assemble(mesh, lam, mu, w);
+    const T = nodeTools(mesh);
+    const { fix, ties, f } = setup(mesh, p, T);
 
     if (ties.length) {
       const kp = 1e4 * K.maxDiag();
@@ -650,9 +788,8 @@
 
     K.factor();
     const u = K.solve(f);
-    const st = stresses(mesh, el, u);
+    const st = stresses(mesh, cache, u, lam, mu);
 
-    // Displacement magnitude and maxima.
     const umag = new Float64Array(mesh.nn);
     let maxU = 0, maxVM = 0, maxVMNode = 0;
     for (let i = 0; i < mesh.nn; i++) {
@@ -661,43 +798,61 @@
       if (st.vm[i] > maxVM) { maxVM = st.vm[i]; maxVMNode = i; }
     }
 
-    // Probe (strain-gauge) slice: largest |σx| on the surface of that cross-section.
-    const iProbe = Math.min(mesh.nx, Math.max(0, Math.round(p.xProbe / mesh.dx)));
-    const xProbe = iProbe * mesh.dx;
-    let probeNode = mesh.id(iProbe, 0, 0), probeSx = 0;
-    faceNodes(mesh, iProbe).forEach(node => {
+    // Strain-gauge probe: the node plane closest to x, largest |σx| on it.
+    const xyz = mesh.xyz, L = mesh.L;
+    const xTarget = Math.min(L, Math.max(0, p.xProbe));
+    let xSnap = 0, bd = Infinity;
+    for (let i = 0; i < mesh.nn; i++) {
+      const dx = Math.abs(xyz[3 * i] - xTarget);
+      if (dx < bd) { bd = dx; xSnap = xyz[3 * i]; }
+    }
+    let probeNode = -1, probeSx = 0;
+    T.plane(xSnap).forEach(node => {
       const sx = st.nodalStress[6 * node];
-      if (Math.abs(sx) > Math.abs(probeSx)) { probeSx = sx; probeNode = node; }
+      if (probeNode < 0 || Math.abs(sx) > Math.abs(probeSx)) { probeSx = sx; probeNode = node; }
     });
     const ps = st.nodalStress.subarray(6 * probeNode, 6 * probeNode + 6);
     const probeStrain = (ps[0] - p.nu * (ps[1] + ps[2])) / p.E;
 
-    // Characteristic deflection for comparison with beam theory.
-    const { nx, ny, nz, id } = mesh, jc = ny / 2, kc = nz / 2;
+    // Characteristic displacement to compare with the hand calculation.
+    const ux = n0 => u[3 * n0];
     let delta;
-    if (p.test === 'cantilever') {
-      const t = id(nx, jc, kc);
-      delta = Math.hypot(u[3 * t], u[3 * t + 1], u[3 * t + 2]);
-    } else if (p.test === 'threePoint') {
-      delta = Math.abs(u[3 * id(nx / 2, jc, kc) + 2]);
-    } else if (p.test === 'buckling' && p.ends === 'pinned-pinned') {
-      delta = Math.abs(u[3 * id(nx, jc, kc)] - u[3 * id(0, jc, kc)]);
-    } else {
-      delta = Math.abs(u[3 * id(nx, jc, kc)]);
+    switch (p.scenario) {
+      case 'cantilever':
+        delta = umag[T.nearest(L, 0, 0)];
+        break;
+      case 'threePoint':
+        delta = Math.abs(u[3 * T.nearest(L / 2, 0, 0) + 2]);
+        break;
+      case 'buckling':
+        delta = Math.abs(ux(T.nearest(L, 0, 0)) - ux(T.nearest(0, 0, 0)));
+        break;
+      case 'manual':
+        delta = maxU;
+        break;
+      default:
+        delta = Math.abs(ux(T.nearest(L, 0, 0)));
     }
 
     const result = {
       params: p, mesh, u, umag, maxU, maxVM, maxVMNode,
       vm: st.vm, nodalStress: st.nodalStress,
-      probe: { i: iProbe, x: xProbe, node: probeNode, sx: probeSx, strain: probeStrain },
+      probe: { x: xSnap, node: probeNode, sx: probeSx, strain: probeStrain },
       delta,
-      hand: hand(p, xProbe),
+      hand: hand(p, xSnap),
       dofs: n,
       bandwidth: w,
     };
 
-    if (p.test === 'buckling') {
-      const bk = buckle(mesh, el, K, fixed, st.elemStress, w);
+    if (p.geometry === 'plate' && p.scenario === 'tension') {
+      // Measured Kt: peak σx across the hole section divided by the net-section stress.
+      let peak = 0;
+      T.plane(mesh.hole.x).forEach(node => { peak = Math.max(peak, st.nodalStress[6 * node]); });
+      result.ktFE = peak / result.hand.sigmaNom;
+    }
+
+    if (p.scenario === 'buckling') {
+      const bk = buckle(mesh, cache, K, fixed, st.elemStress, w);
       result.buckling = bk;
       if (bk.mode) {
         const mmag = new Float64Array(mesh.nn);
@@ -713,11 +868,16 @@
       }
     }
 
-    result.timeMs = (typeof performance !== 'undefined' ? performance : Date).now() - t0;
+    result.timeMs = now() - t0;
     return result;
   }
 
-  const FE = { analyze, hand, forceVector, sectionProps, vonMises, K_FACTOR, _internal: { jacobiEig, generalizedEig, Band, boxElement, elasticity } };
+  const FE = {
+    analyze, hand, forceVector, manualStable, vonMises, ktHole, SCENARIOS, K_FACTOR,
+    buildMesh: (geometry, dims, density) => FEMesh.build(geometry, dims, density),
+    validateDims: (geometry, dims) => FEMesh.validate(geometry, dims),
+    _internal: { jacobiEig, generalizedEig, Band, elementStiffness },
+  };
   if (typeof module !== 'undefined' && module.exports) module.exports = FE;
   else root.FE = FE;
 })(this);
