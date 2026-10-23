@@ -79,7 +79,6 @@
     // Pick a new deformation scale on the next draw, then keep it fixed so that
     // changing the force, material or size visibly changes the deformed shape.
     scaleAuto: true,
-    animate: false,
   };
 
   const key = () => `${state.geometry}:${state.scenario}`;
@@ -346,7 +345,6 @@
         $('resultsEmpty').hidden = false;
         $('resultsBody').hidden = true;
         View.preview(mesh);
-        syncAnimation();
         setStatus('Choose a test in step 3 to run the simulation');
         return;
       }
@@ -384,7 +382,6 @@
         $('resultsEmpty').hidden = false;
         $('resultsBody').hidden = true;
         try { View.preview(FE.buildMesh(p.geometry, p.dims, p.density)); } catch (err) { /* message already shown */ }
-        syncAnimation();
       }
     }, 0));
   }
@@ -422,21 +419,92 @@
     }
     $('scale').disabled = used.isMode;
     $('scaleUsed').textContent = used.label;
-    syncAnimation();
   }
 
-  // Play the result as the load goes from 0 to F (or the buckling mode swinging).
-  function syncAnimation() {
-    const r = state.result, btn = $('animate'), info = $('animInfo');
-    btn.disabled = !r;
-    const on = View.setPlaying(state.animate && !!r, f => {
-      info.textContent = $('field').value === 'mode' && r.buckling
-        ? 'buckling mode, swinging'
-        : `load ${Math.round(100 * f)}% · ${fmt(f * r.params.F, 3)} N`;
-    });
-    btn.textContent = on ? '❚❚ Pause' : '▶ Animate';
-    btn.classList.toggle('on', on);
-    if (!on) info.textContent = '';
+  // ---------- animation ----------
+  // Media controls in the results panel. The solve is linear, so the result at a
+  // fraction f of the load is f × the full result: playing needs no extra solving.
+
+  const RAMP_MS = 2000; // 0 → F at 1× speed
+  const svg = d => `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="${d}"/></svg>`;
+  const ICONS = {
+    start: svg('M3 3h2v10H3zM13 3v10L6 8z'),
+    back: svg('M8 3v10L2 8zM15 3v10L9 8z'),
+    play: svg('M4 2.5v11L13.5 8z'),
+    pause: svg('M3.5 3h3v10h-3zM9.5 3h3v10h-3z'),
+    fwd: svg('M1 3v10l6-5zM8 3v10l6-5z'),
+    stop: svg('M3.5 3.5h9v9h-9z'),
+  };
+  const anim = { playing: false, f: 1, dir: 1, phase: Math.PI / 2, last: 0 };
+
+  const showingMode = () => !!(state.result && state.result.buckling && $('field').value === 'mode');
+
+  function animTick() {
+    const now = performance.now(), dt = Math.min(100, now - anim.last);
+    anim.last = now;
+    if (anim.playing && state.result) {
+      const speed = parseFloat($('animSpeed').value) || 1;
+      if (showingMode()) anim.phase += 2 * Math.PI * dt * speed / (1.5 * RAMP_MS);
+      else {
+        anim.f += anim.dir * dt * speed / RAMP_MS;
+        if (anim.f >= 1) {
+          anim.f = 1;
+          if ($('animRepeat').checked) anim.dir = -1; else anim.playing = false;
+        } else if (anim.f <= 0) { anim.f = 0; anim.dir = 1; }
+      }
+    }
+    View.setFactor(showingMode() ? Math.sin(anim.phase) : anim.f);
+    renderAnim();
+  }
+
+  function animPlay() {
+    if (!state.result) return;
+    if (anim.playing) { anim.playing = false; return; }
+    if (!showingMode() && anim.f >= 1 && !$('animRepeat').checked) anim.f = 0;
+    if (anim.f >= 1) anim.dir = -1;
+    else if (anim.f <= 0) anim.dir = 1;
+    anim.playing = true;
+  }
+  function animStop() { anim.playing = false; anim.f = 1; anim.dir = 1; anim.phase = Math.PI / 2; }
+  function animToStart() { anim.f = 0; anim.dir = 1; anim.phase = 0; }
+  function animStep(d) {
+    anim.playing = false;
+    // Snap to the next 10% mark in that direction.
+    const k = d > 0 ? Math.floor(10 * anim.f + 1e-6) + 1 : Math.ceil(10 * anim.f - 1e-6) - 1;
+    anim.f = Math.min(1, Math.max(0, k / 10));
+  }
+
+  let animShown = '';
+  function renderAnim() {
+    const r = state.result, mode = showingMode();
+    ['animStart', 'animBack', 'animFwd', 'animLoad'].forEach(id => { $(id).disabled = mode; });
+    const play = $('animPlay');
+    play.classList.toggle('on', anim.playing);
+    play.innerHTML = anim.playing ? ICONS.pause : ICONS.play;
+    play.title = anim.playing ? 'Pause' : 'Play';
+    if (!r) return;
+    const f = anim.f, p = r.params, key = `${mode}|${anim.playing}|${f.toFixed(3)}|${r.timeMs}`;
+    if (key === animShown) return; // nothing changed since the last frame
+    animShown = key;
+    if (document.activeElement !== $('animLoad')) $('animLoad').value = mode ? '' : Math.round(100 * f);
+
+    const rows = [];
+    const row = (label, value, unit, cls = '') => rows.push(`<tr class="${cls}"><td>${label}</td><td>${value}${unit ? ` <span class="diff">${unit}</span>` : ''}</td></tr>`);
+    if (mode) {
+      row('Showing', 'buckling mode 1', '');
+      row('Critical load P<sub>cr</sub>', fmt(r.buckling.Pcr), 'N');
+      rows.push('<tr><td colspan="2" class="muted">The mode swings to both sides: a perfect column can buckle either way. Its size is not physical.</td></tr>');
+    } else {
+      const yieldAt = r.maxVM > 0 ? p.sy / r.maxVM : Infinity;
+      row(p.scenario === 'buckling' ? 'Load P' : 'Load F', `${fmt(f * p.F, 4)} <span class="diff">N (${Math.round(100 * f)}%)</span>`, '');
+      row('Max von Mises', fmt(f * r.maxVM, 4), 'MPa', f * r.maxVM > p.sy ? 'over' : '');
+      row('Max displacement', fmt(f * r.maxU, 4), 'mm');
+      row('Strain at gauge', fmt(f * Math.abs(r.probe.strain) * 1e6, 4), 'µε');
+      row('First yield at', yieldAt <= 1
+        ? `${fmt(yieldAt * p.F, 4)} <span class="diff">N (${Math.round(100 * yieldAt)}% of F)</span>`
+        : `${fmt(yieldAt * p.F, 4)} <span class="diff">N (above F)</span>`, '');
+    }
+    $('animReadout').innerHTML = rows.join('');
   }
 
   // ---------- results ----------
@@ -503,6 +571,8 @@
     $('results').innerHTML = rows.join('');
     $('warnings').innerHTML = notes.map(([cls, html]) => `<div class="note ${cls}">${html}</div>`).join('');
     $('explain').innerHTML = explanation(p, r);
+    $('method').innerHTML = methodHtml(p, r);
+    animShown = '';
 
     const buck = p.scenario === 'buckling';
     $('measPcrRow').hidden = !buck;
@@ -510,6 +580,48 @@
     $('measStrainRow').hidden = buck;
     $('measDeltaLabel').textContent = H ? `Measured ${H.deltaLabel.replace(/ \(.*\)/, '').toLowerCase()}` : 'Measured max displacement';
     $('xp').value = +r.probe.x.toFixed(2);
+  }
+
+  // Step-by-step description of the finite element calculation behind the current result.
+  function methodHtml(p, r) {
+    const m = r.mesh, bk = r.buckling;
+    const lam = p.E * p.nu / ((1 + p.nu) * (1 - 2 * p.nu)), mu = p.E / (2 * (1 + p.nu));
+    const supports = {
+      tension: 'The end face at x = 0 is held in the axial direction only (ideal grip), so it can still contract sideways. Two extra points stop the bar sliding sideways or twisting. The force F is spread over the end face at x = L in proportion to area (a uniform traction).',
+      compression: 'Same as the tensile test with the force reversed: the face at x = 0 is held axially, and F pushes on the face at x = L, spread uniformly.',
+      cantilever: 'Every node on the face at x = 0 is fully fixed (a rigid wall). F acts downwards, spread uniformly over the end face at x = L.',
+      threePoint: 'The bottom edges at x = 0 and x = L rest on line supports (one holds the bar axially, the other lets it slide like a roller). F acts downwards along a line across the top at mid-span.',
+      buckling: {
+        'fixed-free': 'Face at x = 0 fully fixed; the reference load P pushes on the face at x = L, which is free to move sideways.',
+        'pinned-pinned': 'Equal and opposite loads P on both end faces. Only a few points are held, just enough to stop rigid-body motion, so both ends can rotate freely.',
+        'fixed-pinned': 'Face at x = 0 fully fixed; the centre of the face at x = L cannot move sideways but the end can rotate.',
+        'fixed-fixed': 'Face at x = 0 fully fixed. The face at x = L cannot move sideways and is tied so that it stays flat (a stiff spring, the "penalty method", links each node to the centre), so it can only slide along the axis.',
+      }[p.ends],
+      manual: 'Fixed holds every node of the end face. Pinned holds the line of nodes across the width at mid-thickness (a hinge: it cannot move, but it can rotate). Roller holds the same line in the up/down direction only. The force is spread over the cross-section where it is applied.',
+    }[p.scenario];
+
+    const steps = [
+      `<b>Mesh.</b> The specimen is split into ${m.ne.toLocaleString()} brick (hexahedral) elements with ${m.nn.toLocaleString()} corner nodes. Each node can move in x, y and z, so there are ${r.dofs.toLocaleString()} unknown displacements u.`,
+      `<b>Material.</b> Linear elastic and isotropic. Hooke's law σ = D·ε uses the Lamé constants
+        <span class="eq">λ = Eν / ((1+ν)(1−2ν)) = ${fmt(lam, 4)} MPa,  μ = G = E / (2(1+ν)) = ${fmt(mu, 4)} MPa</span>`,
+      `<b>Element stiffness.</b> Each 8-node brick gets a 24×24 stiffness matrix
+        <span class="eq">kₑ = ∫ Bᵀ·D·B dV</span>
+        integrated with 2×2×2 Gauss points. B turns nodal displacements into strains. Plain bricks are far too stiff in bending, so each element gets 9 extra "incompatible" bending modes (Wilson–Taylor), which are eliminated inside the element (static condensation). This is why only a few elements through the thickness still give beam-theory accuracy.`,
+      `<b>Assembly.</b> All element matrices are added into one global system
+        <span class="eq">K·u = f</span>
+        The nodes are renumbered (reverse Cuthill–McKee) so that K stays a narrow band: ${r.bandwidth} entries wide instead of ${r.dofs.toLocaleString()}.`,
+      `<b>Supports and load.</b> ${supports} A supported direction is enforced by setting that displacement to zero in K·u = f.`,
+      `<b>Solve.</b> K is symmetric and positive definite, so it is factorised as K = L·Lᵀ (banded Cholesky) and u is found by forward and back substitution. If the supports cannot hold the specimen, K is singular and you get a message instead of a result.`,
+      `<b>Stresses.</b> At each Gauss point, ε = B·u and σ = D·ε. The values are extrapolated to the element corners and averaged at shared nodes. The von Mises stress combines the six components:
+        <span class="eq">σ<sub>vM</sub> = √(½[(σx−σy)² + (σy−σz)² + (σz−σx)²] + 3(τxy² + τyz² + τzx²))</span>`,
+    ];
+    if (bk) {
+      steps.push(`<b>Buckling.</b> The stresses under the reference load P give a geometric stiffness K<sub>G</sub>: compression makes the column softer against sideways bending. The solver looks for the load factor λ at which the column loses stiffness:
+        <span class="eq">(K + λ·K<sub>G</sub>)·φ = 0,  P<sub>cr</sub> = λ·P</span>
+        The smallest λ and its mode shape φ are found by subspace iteration with 4 trial vectors${bk.iterations ? ` (${bk.iterations} iterations here)` : ''}. This is linear (Euler-type) buckling of a perfect column.`);
+    }
+    steps.push(`<b>Assumptions.</b> Small displacements, linear elastic material, no contact, no plasticity. That means every result is proportional to the load, which is why the animation can show any load fraction without solving again. Above σ<sub>y</sub> the real specimen would yield, so results there are only indicative.`);
+    return `<ol>${steps.map(t => `<li>${t}</li>`).join('')}</ol><p class="muted">Solved in ${r.timeMs.toFixed(0)} ms in your browser (JavaScript, no server).</p>`;
   }
 
   function explanation(p, r) {
@@ -643,10 +755,9 @@
     const BANDS = 12;
     const BEYOND = [0.85, 0.2, 0.85]; // magenta: outside the colour range (e.g. above yield)
     let renderer, scene, camera, controls, container, model, colorTex, fitKey = '';
-    let disposables = [];
+    let disposables = [], onTick = null;
     // Animation: the solution is linear, so the result at a fraction f of the load is f × the result.
-    const PERIOD = 3000; // ms per cycle
-    let anim = null, playing = false, t0 = 0;
+    let anim = null, factor = 1;
 
     function bandRGB(i) {
       const c = new THREE.Color().setHSL((1 - i / (BANDS - 1)) * 240 / 360, 0.95, 0.5);
@@ -703,11 +814,7 @@
       (function loop() {
         requestAnimationFrame(loop);
         controls.update();
-        if (playing && anim) {
-          const ph = 2 * Math.PI * ((performance.now() - t0) % PERIOD) / PERIOD;
-          // Static tests: load rises 0 → F and back. Buckling mode: swings to both sides.
-          applyFactor(anim.isMode ? Math.sin(ph) : (1 - Math.cos(ph)) / 2);
-        }
+        if (onTick) onTick();
         renderer.render(scene, camera);
       })();
     }
@@ -768,18 +875,16 @@
         const d = (f - 1) * scale;
         obj.position.set(base.x + d * disp[3 * n], base.y + d * disp[3 * n + 1], base.z + d * disp[3 * n + 2]);
       }
-      if (anim.onFrame) anim.onFrame(f);
     }
 
-    function setPlaying(on, onFrame) {
-      playing = !!on && !!anim;
-      t0 = performance.now();
-      if (anim) {
-        anim.onFrame = playing ? onFrame : null;
-        if (!playing) applyFactor(1);
-      }
-      return playing;
+    // f: load fraction (0 – 1), or the swing (−1 – 1) of a buckling mode.
+    function setFactor(f) {
+      if (f === factor) return;
+      factor = f;
+      if (anim) applyFactor(f);
     }
+
+    function setTick(fn) { onTick = fn; }
 
     // Boundary quads as separate flat-shaded faces; uv.x carries the colour value.
     function surface(mesh, pos, texU, material) {
@@ -804,7 +909,6 @@
     function preview(mesh) {
       clear();
       anim = null;
-      playing = false;
       const xyz = mesh.xyz, pos = n => [xyz[3 * n], xyz[3 * n + 1], xyz[3 * n + 2]];
       surface(mesh, pos, null, new THREE.MeshLambertMaterial({
         color: 0xb7bfcc, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
@@ -870,9 +974,8 @@
       if (o.showMesh) targets.push(lines(mesh.edges, pos, 0x000000, 0.22));
       if (o.showUndeformed) lines(mesh.features, n => [xyz[3 * n], xyz[3 * n + 1], xyz[3 * n + 2]], 0x7a8494, 0.7);
 
-      const onFrame = anim && anim.onFrame;
-      anim = { xyz, disp, scale, texU, targets, glyphs: glyphs(r, pos), isMode: !!isMode, onFrame };
-      if (!playing) applyFactor(1);
+      anim = { xyz, disp, scale, texU, targets, glyphs: glyphs(r, pos), isMode: !!isMode };
+      if (factor !== 1) applyFactor(factor);
       legend(title, unit, vmin, vmax, rangeNote, o.field === 'sx');
       fitOnce(mesh);
       return { scale, label, isMode: !!isMode };
@@ -983,7 +1086,7 @@
       $('legend').hidden = false;
     }
 
-    return { init, update, preview, fit, setPlaying };
+    return { init, update, preview, fit, setFactor, setTick };
   })();
 
   // ---------- start ----------
@@ -1008,7 +1111,22 @@
     ['field', 'showMesh', 'showUndeformed'].forEach(id => $(id).addEventListener('change', redraw));
     $('scale').addEventListener('change', () => { state.scaleAuto = !(parseFloat($('scale').value) > 0); redraw(); });
     $('autoScale').addEventListener('click', () => { state.scaleAuto = true; redraw(); });
-    $('animate').addEventListener('click', () => { state.animate = !state.animate; syncAnimation(); });
+    $('animPlay').addEventListener('click', animPlay);
+    $('animStop').addEventListener('click', animStop);
+    $('animStart').addEventListener('click', animToStart);
+    $('animBack').addEventListener('click', () => animStep(-1));
+    $('animFwd').addEventListener('click', () => animStep(1));
+    $('animLoad').addEventListener('change', e => {
+      const v = parseFloat(e.target.value);
+      anim.playing = false;
+      if (isFinite(v)) anim.f = Math.min(1, Math.max(0, v / 100));
+      animShown = '';
+    });
+    ['animStart', 'animBack', 'animPlay', 'animFwd', 'animStop'].forEach(id => {
+      const b = $(id);
+      b.innerHTML = ICONS[b.dataset.icon];
+    });
+    View.setTick(animTick);
     $('range').addEventListener('change', () => { $('rangeMaxWrap').hidden = $('range').value !== 'fixed'; redraw(); });
     $('rangeMax').addEventListener('change', redraw);
     $('resetView').addEventListener('click', () => state.result && View.fit(state.result.mesh));

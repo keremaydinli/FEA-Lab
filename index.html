@@ -80,8 +80,6 @@
         <label class="check"><input id="showMesh" type="checkbox" checked> Mesh</label>
         <label class="check"><input id="showUndeformed" type="checkbox" checked> Undeformed</label>
         <button id="resetView" type="button">Reset view</button>
-        <button id="animate" type="button" title="Play the result as the load rises from 0 to F" disabled>▶ Animate</button>
-        <span id="animInfo" class="muted anim-info"></span>
       </div>
       <div id="legend" class="legend" hidden></div>
       <div id="error" class="error" hidden></div>
@@ -96,7 +94,34 @@
       <div id="resultsBody" hidden>
         <div id="warnings"></div>
         <table class="cmp" id="results"></table>
+        <section class="anim">
+          <h2>Animation</h2>
+          <div class="media" role="group" aria-label="Animation controls">
+            <button id="animStart" type="button" data-icon="start" title="Go to zero load"></button>
+            <button id="animBack" type="button" data-icon="back" title="10% less load"></button>
+            <button id="animPlay" type="button" data-icon="play" class="play" title="Play"></button>
+            <button id="animFwd" type="button" data-icon="fwd" title="10% more load"></button>
+            <button id="animStop" type="button" data-icon="stop" title="Stop at full load"></button>
+          </div>
+          <div class="anim-opts">
+            <label>Load <span class="field"><input id="animLoad" type="number" min="0" max="100" step="any"><span class="unit">%</span></span></label>
+            <label>Speed
+              <select id="animSpeed">
+                <option value="0.25">0.25×</option>
+                <option value="0.5">0.5×</option>
+                <option value="1" selected>1×</option>
+                <option value="2">2×</option>
+              </select>
+            </label>
+            <label class="check"><input id="animRepeat" type="checkbox" checked> Repeat</label>
+          </div>
+          <table class="readout" id="animReadout"></table>
+        </section>
         <div class="explain" id="explain"></div>
+        <details class="method">
+          <summary>How is this calculated?</summary>
+          <div id="method"></div>
+        </details>
         <section class="lab">
           <h2>Compare with your lab test</h2>
           <label class="row">Strain gauge at x <span class="field"><input id="xp" type="number" step="any"><span class="unit">mm</span></span></label>

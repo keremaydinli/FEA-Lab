@@ -264,5 +264,31 @@ table.cmp { width: 100%; border-collapse: collapse; font-variant-numeric: tabula
 .empty-state { color: var(--muted); }
 .lab { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); }
 
-#animate.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
-.anim-info { min-width: 150px; font-variant-numeric: tabular-nums; }
+/* ---------- animation ---------- */
+
+.anim { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); }
+.media { display: flex; justify-content: center; gap: 6px; margin: 4px 0 10px; }
+.media button { display: inline-grid; place-items: center; width: 38px; height: 32px; padding: 0; }
+.media button.play { width: 52px; }
+.media button.on { background: var(--accent); border-color: var(--accent); }
+.media button.on svg { fill: var(--accent-text); }
+.media svg { width: 15px; height: 15px; fill: var(--text); }
+.media button:disabled svg { opacity: .35; }
+.anim-opts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 8px; font-size: 13px; }
+.anim-opts label { display: inline-flex; align-items: center; gap: 6px; }
+.anim-opts input[type=number] { width: 58px; }
+.anim-opts input:disabled { opacity: .5; }
+.readout { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.readout td { padding: 4px 2px; border-bottom: 1px solid var(--border); }
+.readout td:last-child { text-align: right; white-space: nowrap; }
+.readout tr.over td:last-child { color: var(--bad-border); font-weight: 600; }
+.readout td.muted { font-size: 12px; text-align: left; white-space: normal; }
+
+/* ---------- method ---------- */
+
+.method { margin-top: 12px; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+.method summary { cursor: pointer; font-weight: 600; }
+.method ol { margin: 8px 0 4px; padding-left: 18px; }
+.method li { margin: 6px 0; color: var(--muted); }
+.method li b { color: var(--text); }
+.method .eq { display: block; margin: 3px 0; color: var(--text); font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
